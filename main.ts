@@ -297,14 +297,14 @@ function shade(x, y) {
   // ---- everything on the broth surface ----
   if (innerD < 0.006) {
     const er = clamp01(Math.sqrt(((x - BCX) / KRX) ** 2 + ((y - KCY) / KRY) ** 2));
-    let food = mixc([0.955, 0.835, 0.565], [0.775, 0.535, 0.285], smooth(0.3, 1.05, er));
+    let food = mixc([0.925, 0.745, 0.455], [0.70, 0.45, 0.215], smooth(0.3, 1.05, er));
     const brothNoise = fbm(x * 13 + 7, y * 13, 3);
-    food = mixc(food, [0.885, 0.66, 0.385], (brothNoise - 0.5) * 0.38);
+    food = mixc(food, [0.845, 0.585, 0.315], (brothNoise - 0.5) * 0.42);
     const swirl = fbm(x * 6 - y * 4, y * 6 + x * 3, 3);
-    food = mixc(food, [0.985, 0.915, 0.71], smooth(0.55, 0.8, swirl) * 0.5);
+    food = mixc(food, [0.975, 0.885, 0.65], smooth(0.55, 0.8, swirl) * 0.55);
     // broad specular sheen of the key light on the broth, upper left
     const spec = Math.exp(-(((x - 0.36) ** 2) / 0.028 + ((y - 0.50) ** 2) / 0.010));
-    food = mixc(food, [1.0, 0.96, 0.82], spec * 0.28);
+    food = mixc(food, [1.0, 0.965, 0.83], spec * 0.38);
 
     // dense noodle mass from the grid: thick strands in broth tones, the
     // submerged ones (low tone) showing through the broth at half strength
@@ -312,9 +312,9 @@ function shade(x, y) {
     const [md, mtone] = massDist(x, y);
     if (md < 0.005) {
       const core = clamp01(1 - Math.abs(md + 0.0032) / 0.0090);
-      let nc = mixc([0.825, 0.615, 0.31], [0.955, 0.83, 0.515], core);
+      let nc = mixc([0.775, 0.545, 0.245], [0.955, 0.83, 0.515], core);
       nc = mixc(nc, [0.875, 0.66, 0.345], (mtone - 0.5) * 0.30);
-      nc = mixc(nc, [1.0, 0.945, 0.72], smooth(0.82, 1, core) * 0.26);
+      nc = mixc(nc, [1.0, 0.95, 0.74], smooth(0.78, 1, core) * 0.42);
       const subm = mtone < 0.38 ? 0.5 : 1.0;
       const edgeFade = smooth(1.0, 0.88, er);
       food = over(food, nc, cov(md, 0.0016) * subm * (0.35 + 0.65 * edgeFade));
@@ -462,7 +462,7 @@ function shade(x, y) {
         let nc = mixc([0.79, 0.575, 0.27], [0.97, 0.855, 0.535], core);
         nc = mixc(nc, [0.90, 0.685, 0.37], (s.tone - 0.5) * 0.3);
         // wet sheen: a bright thread down the lit side of each strand
-        nc = mixc(nc, [1.0, 0.96, 0.78], smooth(0.72, 1, core) * 0.5);
+        nc = mixc(nc, [1.0, 0.96, 0.78], smooth(0.68, 1, core) * 0.62);
         col = over(col, nc, cov(d, 0.0016));
       }
     }
@@ -620,10 +620,21 @@ function render() {
       const od = sdEllipse(x, y, BCX, BCY, BRX, BRY);
       const f = smooth(0.015, 0.11, od) * 0.7;
       const i3 = (py * W + px) * 3, i4 = (py * W + px) * 4;
-      const dith = dither(px, py) * 0.005;
-      rgba[i4] = Math.round(clamp01(lerp(img[i3], blur[i3], f) + dith) * 255);
-      rgba[i4 + 1] = Math.round(clamp01(lerp(img[i3 + 1], blur[i3 + 1], f) + dith) * 255);
-      rgba[i4 + 2] = Math.round(clamp01(lerp(img[i3 + 2], blur[i3 + 2], f) + dith) * 255);
+      // photographic finish: a touch of saturation and fine film grain
+      let r = lerp(img[i3], blur[i3], f);
+      let g = lerp(img[i3 + 1], blur[i3 + 1], f);
+      let b = lerp(img[i3 + 2], blur[i3 + 2], f);
+      const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+      r = luma + (r - luma) * 1.09;
+      g = luma + (g - luma) * 1.09;
+      b = luma + (b - luma) * 1.09;
+      // (No per-pixel film grain: it triples the PNG size. The dither
+      // below is just enough to keep the gradients band-free.)
+      const grain = 0;
+      const dith = dither(px, py) * 0.004;
+      rgba[i4] = Math.round(clamp01(r + grain + dith) * 255);
+      rgba[i4 + 1] = Math.round(clamp01(g + grain + dith) * 255);
+      rgba[i4 + 2] = Math.round(clamp01(b + grain + dith) * 255);
       rgba[i4 + 3] = 255;
     }
   }
