@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MIT
-// "Steaming Tonkotsu" — food-picture-01 entry (Node 22, standard library only).
+// "Steaming Tonkotsu — The Noodle Pull" — food-picture-01 entry, overhaul
+// (Node 22, standard library only).
 //
 // A fully procedural picture drawn one pixel at a time from signed-distance
-// shapes and smooth value noise: no image files, no network, no randomness.
-// Every pixel is a fixed function of its coordinates, so two runs write
-// byte-identical PNG output.
+// shapes, smooth value noise and several hundred little noodle strands kept
+// in a spatial grid: no image files, no network, no randomness. Every pixel
+// is a fixed function of its coordinates, so two runs write byte-identical
+// PNG output. A final depth pass blurs only what sits outside the bowl, for
+// a shallow depth-of-field feel.
 //
-// Subject: a bowl of tonkotsu ramen seen from a slight overhead angle on a
-// dark wooden table — creamy broth with glossy oil droplets, a springy
-// noodle mass with hero strands, two seared chashu slices, two halved
-// ajitama eggs with jammy yolks, dark nori sheets, scattered spring-onion
-// rings, and a pair of chopsticks lifting a bundle of noodles through soft
-// steam. Warm dramatic light, deep shadows, everything leading the eye to
-// the bowl.
+// Subject: an extreme close-up of a tonkotsu ramen bowl that fills the
+// frame, shot at 45 degrees. Chopsticks lift a tall, glossy bundle of
+// noodles out of a creamy broth — the noodle pull is the hero. Around it:
+// seared chashu with fat marbling, two ajitama halves with jammy yolks,
+// nori, menma, spring onions, chilli oil and sesame, under warm dramatic
+// light with soft steam curling through the top of the frame.
 //
 // Run it the way the grader does:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -53,7 +55,6 @@ function sdSegment(px, py, ax, ay, bx, by) {
   const dx = pax - bax * h, dy = pay - bay * h;
   return Math.sqrt(dx * dx + dy * dy);
 }
-// Signed distance to a rotated rectangle centred at (cx, cy).
 function sdBoxRot(px, py, cx, cy, hx, hy, ang) {
   const c = Math.cos(ang), s = Math.sin(ang);
   const dx = px - cx, dy = py - cy;
@@ -62,14 +63,10 @@ function sdBoxRot(px, py, cx, cy, hx, hy, ang) {
   const ox = Math.max(qx, 0), oy = Math.max(qy, 0);
   return Math.sqrt(ox * ox + oy * oy) + Math.min(Math.max(qx, qy), 0);
 }
-// Coverage of a shape from its signed distance (negative = inside).
 function cov(d, feather) { return clamp01(0.5 - d / (2 * feather)); }
-// Alpha-blend colour fg over bg with coverage a.
 function over(bg, fg, a) {
   return [lerp(bg[0], fg[0], a), lerp(bg[1], fg[1], a), lerp(bg[2], fg[2], a)];
 }
-
-// Deterministic value noise: a hashed integer lattice, smoothly interpolated.
 function hash2(ix, iy) {
   let n = (ix * 374761393 + iy * 668265263) | 0;
   n = Math.imul(n ^ (n >>> 13), 1274126177);
@@ -91,140 +88,126 @@ function fbm(x, y, oct) {
   }
   return v / tot;
 }
-// Tiny deterministic per-pixel hash for dithering (breaks gradient banding).
-function dither(x, y) {
-  return hash2(x * 7 + 13, y * 7 + 29) - 0.5;
+function dither(x, y) { return hash2(x * 7 + 13, y * 7 + 29) - 0.5; }
+// One deterministic LCG shared by all layout generation below.
+function makeRnd(seed0) {
+  let seed = seed0;
+  return () => {
+    seed = (Math.imul(seed, 1103515245) + 12345) | 0;
+    return ((seed >>> 0) % 10000) / 10000;
+  };
 }
 
 // ------------------------------------------------------------- scene data --
 
-// Bowl geometry (normalised coordinates, y down).
-const BCX = 0.5, BCY = 0.565;          // bowl centre
-const BRX = 0.365, BRY = 0.295;        // outer rim ellipse
-const KRX = 0.322, KRY = 0.254;        // broth surface ellipse
-const KCY = BCY - 0.006;               // broth centre height
+const BCX = 0.5, BCY = 0.64;           // bowl centre
+const BRX = 0.435, BRY = 0.345;        // outer rim ellipse
+const KRX = 0.378, KRY = 0.272;        // broth surface ellipse
+const KCY = BCY - 0.012;               // broth centre height
+const GRIP = [0.56, 0.175];            // chopstick grip point
 
-// Hero noodle strands lying on the broth. Two families, both generated with
-// a deterministic LCG so the layout is identical on every run: loose wavy
-// strands that wander across the bowl, and tight coils (little noodle nests)
-// that read as a springy noodle mass even at thumbnail size.
-const brothStrands = [];
+function inBroth(x, y, scale) {
+  const ex = (x - BCX) / (KRX * scale), ey = (y - KCY) / (KRY * scale);
+  return ex * ex + ey * ey <= 1;
+}
+function clampToBroth(x, y, scale) {
+  const ex = (x - BCX) / (KRX * scale), ey = (y - KCY) / (KRY * scale);
+  const q = Math.sqrt(ex * ex + ey * ey);
+  if (q <= 1) return [x, y];
+  return [BCX + ex / q * KRX * scale, KCY + ey / q * KRY * scale];
+}
+
+// Dense noodle mass: hundreds of short curved strands wandering inside the
+// broth, stored in a spatial grid so each pixel only tests its neighbours.
+const CELL = 0.075;
+const grid = new Map();
+function gridKey(cx, cy) { return cx * 1000 + cy; }
+function addToGrid(pts, r, tone) {
+  // Register each strand once, in the cell holding its midpoint: strands
+  // are short (<= ~0.1), so a 3x3 neighbourhood of 0.06 cells always
+  // reaches every strand that can touch a pixel.
+  const mid = pts[Math.floor(pts.length / 2)];
+  const k = gridKey(Math.floor(mid[0] / CELL), Math.floor(mid[1] / CELL));
+  if (!grid.has(k)) grid.set(k, []);
+  grid.get(k).push({ pts, r, tone });
+}
 {
-  let seed = 1234567;
-  const rnd = () => {
-    seed = (Math.imul(seed, 1103515245) + 12345) | 0;
-    return ((seed >>> 0) % 10000) / 10000;
-  };
-  const clampToBroth = (x, y) => {
-    const ex = (x - BCX) / (KRX * 0.96), ey = (y - KCY) / (KRY * 0.94);
-    const q = Math.sqrt(ex * ex + ey * ey);
-    if (q <= 1) return [x, y];
-    return [BCX + ex / q * KRX * 0.96, KCY + ey / q * KRY * 0.94];
-  };
-  // Wavy wanderers: two sine octaves so they never look ruled straight.
-  for (let i = 0; i < 11; i++) {
-    const yBase = KCY - KRY * 0.58 + (i / 11) * KRY * 1.16 + (rnd() - 0.5) * 0.02;
-    const amp1 = 0.014 + rnd() * 0.016, amp2 = 0.005 + rnd() * 0.007;
-    const per1 = 1.1 + rnd() * 1.3, per2 = 3.0 + rnd() * 2.0;
-    const ph = rnd() * 6.283, ph2 = rnd() * 6.283;
-    const drift = (rnd() - 0.5) * 0.05;
-    const x0 = BCX - KRX * (0.5 + rnd() * 0.36);
-    const x1 = BCX + KRX * (0.5 + rnd() * 0.36);
-    const pts = [];
-    const N = 22;
-    for (let j = 0; j <= N; j++) {
-      const t = j / N;
-      const x = lerp(x0, x1, t);
-      const y = yBase + drift * (t - 0.5)
-        + Math.sin(t * per1 * 6.283 + ph) * amp1
-        + Math.sin(t * per2 * 6.283 + ph2) * amp2;
-      pts.push(clampToBroth(x, y));
+  const rnd = makeRnd(20261114);
+  for (let i = 0; i < 880; i++) {
+    // random start inside the broth, random walk with gentle curvature
+    const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.9;
+    let x = BCX + Math.cos(a) * rr * KRX * 0.94;
+    let y = KCY + Math.sin(a) * rr * KRY * 0.9;
+    let dir = rnd() * 6.283;
+    const steps = 6 + Math.floor(rnd() * 4);
+    const stepLen = 0.015 + rnd() * 0.010;
+    const pts = [[x, y]];
+    for (let j = 0; j < steps; j++) {
+      dir += (rnd() - 0.5) * 1.5;
+      x += Math.cos(dir) * stepLen;
+      y += Math.sin(dir) * stepLen * 0.8;
+      pts.push(clampToBroth(x, y, 0.94));
     }
-    brothStrands.push({ pts, r: 0.0058 + rnd() * 0.0022, ph });
+    addToGrid(pts, 0.0062 + rnd() * 0.0036, rnd());
   }
-  // Coils: loose expanding spirals around five nest centres — few turns
-  // and thick strands, so they read as noodle nests, not fingerprints.
-  const nests = [[0.40, 0.50], [0.55, 0.44], [0.63, 0.63], [0.44, 0.65], [0.545, 0.555]];
-  for (const [nx, ny] of nests) {
-    for (let k = 0; k < 3; k++) {
-      const pts = [];
-      const turns = 1.05 + rnd() * 0.55;
-      const r0 = 0.007 + k * 0.004, r1 = 0.032 + rnd() * 0.020 + k * 0.007;
-      const ph = rnd() * 6.283;
-      const N = 30;
-      for (let j = 0; j <= N; j++) {
-        const t = j / N;
-        const a = ph + t * turns * 6.283;
-        const rr = lerp(r0, r1, t);
-        pts.push(clampToBroth(nx + Math.cos(a) * rr, ny + Math.sin(a) * rr * 0.78));
-      }
-      brothStrands.push({ pts, r: 0.0062 + rnd() * 0.0020, ph });
+  // Loose wavy hero strands crossing the bowl, on top of the mass.
+  for (let i = 0; i < 12; i++) {
+    const yBase = KCY - KRY * 0.55 + (i / 12) * KRY * 1.1 + (rnd() - 0.5) * 0.02;
+    const amp1 = 0.013 + rnd() * 0.015, per1 = 1.1 + rnd() * 1.2;
+    const ph = rnd() * 6.283, drift = (rnd() - 0.5) * 0.05;
+    const x0 = BCX - KRX * (0.5 + rnd() * 0.36), x1 = BCX + KRX * (0.5 + rnd() * 0.36);
+    const pts = [];
+    for (let j = 0; j <= 20; j++) {
+      const t = j / 20;
+      pts.push(clampToBroth(lerp(x0, x1, t),
+        yBase + drift * (t - 0.5) + Math.sin(t * per1 * 6.283 + ph) * amp1, 0.96));
     }
+    addToGrid(pts, 0.0062 + rnd() * 0.002, rnd());
   }
 }
-// Noodle bundle lifted by the chopsticks: strands hanging from the grip.
-const GRIP = [0.615, 0.255];
+function massDist(x, y) {
+  const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+  let best = 1e9, tone = 0.5;
+  for (let ix = cx - 1; ix <= cx + 1; ix++) for (let iy = cy - 1; iy <= cy + 1; iy++) {
+    const cell = grid.get(gridKey(ix, iy));
+    if (!cell) continue;
+    for (const rec of cell) {
+      for (let j = 0; j < rec.pts.length - 1; j++) {
+        const dd = sdSegment(x, y, rec.pts[j][0], rec.pts[j][1], rec.pts[j + 1][0], rec.pts[j + 1][1]) - rec.r;
+        if (dd < best) { best = dd; tone = rec.tone; }
+      }
+    }
+  }
+  return [best, tone];
+}
+
+// The noodle pull: a tall bundle hanging from the grip, strands that bow
+// outward then fall, each with its own length and sway.
 const liftStrands = [];
 {
-  let seed = 987654;
-  const rnd = () => {
-    seed = (Math.imul(seed, 1103515245) + 12345) | 0;
-    return ((seed >>> 0) % 10000) / 10000;
-  };
-  for (let i = 0; i < 9; i++) {
-    const len = 0.16 + rnd() * 0.13;
-    const sway = (rnd() - 0.5) * 0.03;
-    const gx = GRIP[0] + (rnd() - 0.5) * 0.018;
+  const rnd = makeRnd(987654);
+  for (let i = 0; i < 23; i++) {
+    // three short "peelers" escape the bundle early; the rest cascade down
+    const peeler = i >= 20;
+    const len = peeler ? 0.17 + rnd() * 0.09 : 0.31 + rnd() * 0.155;
+    const gx = GRIP[0] + (rnd() - 0.5) * 0.042;
+    const bow = peeler ? (rnd() < 0.5 ? -1 : 1) * (0.05 + rnd() * 0.05)
+      : (rnd() - 0.5) * 0.085;      // sideways bow of the cascade
+    const swayPh = rnd() * 6.283;
     const pts = [];
-    const N = 12;
+    const N = 16;
     for (let j = 0; j <= N; j++) {
       const t = j / N;
-      const x = gx + Math.sin(t * 3.4 + i * 1.7) * 0.011 * t + Math.sin(t * 7.3 + i) * 0.003 * t + sway * t * t;
+      // peelers drift steadily outward as they fall (escaping strands);
+      // cascade strands bow out and settle back toward the bundle
+      const bowCurve = peeler ? bow * t * t : bow * Math.sin(t * Math.PI) * (0.4 + 0.6 * t);
+      const x = gx + bowCurve + Math.sin(t * 5.2 + swayPh) * 0.008 * t;
       const y = GRIP[1] + len * t;
       pts.push([x, y]);
     }
-    liftStrands.push({ pts, r: 0.0046 + rnd() * 0.0016, ph: i * 1.3 });
+    liftStrands.push({ pts, r: 0.0052 + rnd() * 0.0023, tone: rnd() });
   }
 }
-// Spring-onion rings scattered over the broth.
-const onions = [];
-{
-  let seed = 24681357;
-  const rnd = () => {
-    seed = (Math.imul(seed, 1103515245) + 12345) | 0;
-    return ((seed >>> 0) % 10000) / 10000;
-  };
-  // A generous pile near the middle, a sparse scatter elsewhere.
-  for (let i = 0; i < 30; i++) {
-    let x, y;
-    if (i < 16) {
-      const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.055;
-      x = 0.52 + Math.cos(a) * rr;
-      y = 0.545 + Math.sin(a) * rr * 0.8;
-    } else {
-      const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.85;
-      x = BCX + Math.cos(a) * rr * KRX * 0.9;
-      y = KCY + Math.sin(a) * rr * KRY * 0.86;
-    }
-    onions.push([x, y, 0.0045 + rnd() * 0.004]);
-  }
-}
-// Glossy oil droplets floating on the broth.
-const oils = [];
-{
-  let seed = 1357924;
-  const rnd = () => {
-    seed = (Math.imul(seed, 1103515245) + 12345) | 0;
-    return ((seed >>> 0) % 10000) / 10000;
-  };
-  for (let i = 0; i < 26; i++) {
-    const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.9;
-    const x = BCX + Math.cos(a) * rr * KRX * 0.94;
-    const y = KCY + Math.sin(a) * rr * KRY * 0.9;
-    oils.push([x, y, 0.004 + rnd() * 0.011]);
-  }
-}
-
 function strandDist(px, py, pts) {
   let d = 1e9;
   for (let j = 0; j < pts.length - 1; j++) {
@@ -234,157 +217,190 @@ function strandDist(px, py, pts) {
   return d;
 }
 
+// Spring-onion rings: a pile plus a sparse scatter.
+const onions = [];
+{
+  const rnd = makeRnd(24681357);
+  for (let i = 0; i < 34; i++) {
+    let x, y;
+    if (i < 18) {
+      const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.06;
+      x = 0.525 + Math.cos(a) * rr; y = 0.735 + Math.sin(a) * rr * 0.8;
+    } else {
+      const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.85;
+      x = BCX + Math.cos(a) * rr * KRX * 0.9; y = KCY + Math.sin(a) * rr * KRY * 0.86;
+    }
+    onions.push([x, y, 0.0048 + rnd() * 0.0042]);
+  }
+}
+// Oil droplets (golden) and chilli-oil droplets (deep red) on the broth.
+const oils = [];
+const chilli = [];
+{
+  const rnd = makeRnd(1357924);
+  for (let i = 0; i < 30; i++) {
+    const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.92;
+    oils.push([BCX + Math.cos(a) * rr * KRX * 0.94, KCY + Math.sin(a) * rr * KRY * 0.9, 0.004 + rnd() * 0.012]);
+  }
+  for (let i = 0; i < 16; i++) {
+    const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.85;
+    chilli.push([BCX + Math.cos(a) * rr * KRX * 0.9, KCY + Math.sin(a) * rr * KRY * 0.86, 0.003 + rnd() * 0.007]);
+  }
+}
+// Sesame seeds scattered over the front toppings.
+const sesame = [];
+{
+  const rnd = makeRnd(555111);
+  for (let i = 0; i < 42; i++) {
+    const zone = rnd();
+    let x, y;
+    if (zone < 0.45) { const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.075; x = 0.375 + Math.cos(a) * rr; y = 0.695 + Math.sin(a) * rr * 0.8; }
+    else if (zone < 0.75) { const a = rnd() * 6.283, rr = Math.sqrt(rnd()) * 0.05; x = 0.70 + Math.cos(a) * rr; y = 0.65 + Math.sin(a) * rr * 0.8; }
+    else { x = 0.42 + rnd() * 0.3; y = 0.72 + rnd() * 0.1; }
+    sesame.push([x, y, rnd() * 3.14]);
+  }
+}
+
 // ---------------------------------------------------------------- shading --
 
 function shade(x, y) {
-  // ---- table: dark warm wood with soft grain and a pool of light ----
-  const grain = fbm(x * 26, y * 5, 3);
-  let col = mixc([0.105, 0.062, 0.038], [0.185, 0.115, 0.066], grain);
-  const seam = smooth(0.012, 0.0, Math.abs(((y * 5 + fbm(x * 3, y * 3, 2) * 0.05) % 1 + 1) % 1 - 0.5) - 0.47);
-  col = mixc(col, [0.06, 0.035, 0.02], seam * 0.22);
-  const glow = Math.exp(-(((x - 0.5) ** 2) / 0.16 + ((y - 0.52) ** 2) / 0.13));
-  col = mixc(col, [0.32, 0.20, 0.115], glow * 0.55);
-  // scattered sesame / crumbs sparkle on the table, very subtle
-  const spark = vnoise(x * 300, y * 300);
-  if (spark > 0.985) col = mixc(col, [0.75, 0.62, 0.4], 0.35);
+  // ---- table: near-black warm wood, mostly lost in shadow at this range --
+  const grain = fbm(x * 22, y * 5, 3);
+  let col = mixc([0.075, 0.045, 0.028], [0.14, 0.088, 0.05], grain);
+  const glow = Math.exp(-(((x - 0.5) ** 2) / 0.17 + ((y - 0.55) ** 2) / 0.15));
+  col = mixc(col, [0.26, 0.16, 0.09], glow * 0.5);
 
   // ---- soft shadow under the bowl ----
-  const shD = sdEllipse(x, y, BCX, BCY + 0.045, BRX * 1.06, BRY * 1.02);
-  col = mixc([0.03, 0.018, 0.012], col, smooth(-0.06, 0.05, shD));
+  const shD = sdEllipse(x, y, BCX, BCY + 0.05, BRX * 1.05, BRY * 1.0);
+  col = mixc([0.022, 0.013, 0.009], col, smooth(-0.05, 0.05, shD));
 
-  // ---- bowl exterior: deep indigo-black ceramic ----
+  // ---- bowl exterior: deep indigo-black ceramic with a sheen band ----
   const outerD = sdEllipse(x, y, BCX, BCY, BRX, BRY);
   const innerD = sdEllipse(x, y, BCX, KCY, KRX, KRY);
-  if (outerD < 0.01) {
-    // body: everything inside the rim but outside the broth, plus the
-    // lower bowl wall shading toward the foot.
+  if (outerD < 0.012) {
     const t = clamp01((y - (BCY - BRY)) / (2 * BRY));
-    let body = mixc([0.13, 0.135, 0.17], [0.045, 0.045, 0.065], smooth(0.25, 1, t));
-    // a warm bounce from the table on the lower wall
-    body = mixc(body, [0.20, 0.11, 0.06], smooth(0.72, 1, t) * 0.35);
-    // speckled ceramic texture
-    const sp = fbm(x * 90, y * 90, 2);
-    body = mixc(body, [0.22, 0.22, 0.26], (sp - 0.5) * 0.25);
+    let body = mixc([0.115, 0.12, 0.155], [0.038, 0.038, 0.056], smooth(0.22, 1, t));
+    body = mixc(body, [0.19, 0.105, 0.055], smooth(0.72, 1, t) * 0.35);
+    const sp = fbm(x * 80, y * 80, 2);
+    body = mixc(body, [0.21, 0.21, 0.25], (sp - 0.5) * 0.28);
+    // broad sheen sweeping the front wall
+    const sheen = Math.exp(-(((y - (BCY + BRY * 0.38)) ** 2) / 0.004)) * smooth(0.35, 0.0, Math.abs(x - 0.42));
+    body = mixc(body, [0.34, 0.34, 0.38], sheen * 0.30);
     // rim light on the upper-left edge
-    const rim = smooth(0.006, -0.002, outerD) * smooth(0.35, 0.05, Math.abs(y - (BCY - BRY * 0.72)) + Math.abs(x - BCX - 0.1));
+    const rim = smooth(0.007, -0.002, outerD) * smooth(0.4, 0.05, Math.abs(y - (BCY - BRY * 0.7)) + Math.abs(x - BCX - 0.08));
     body = mixc(body, [0.55, 0.55, 0.6], rim * 0.5);
     col = over(col, body, cov(outerD, 0.0035));
-    // foot ring
-    const footD = sdEllipse(x, y, BCX, BCY + BRY * 0.94, 0.115, 0.028);
-    col = over(col, [0.06, 0.06, 0.08], cov(footD, 0.003) * 0.9);
+    const footD = sdEllipse(x, y, BCX, BCY + BRY * 0.95, 0.13, 0.03);
+    col = over(col, [0.05, 0.05, 0.068], cov(footD, 0.003) * 0.9);
   }
 
   // ---- everything on the broth surface ----
   if (innerD < 0.006) {
-    // creamy tonkotsu broth: pale gold, deeper at the edges, bright centre
     const er = clamp01(Math.sqrt(((x - BCX) / KRX) ** 2 + ((y - KCY) / KRY) ** 2));
-    let food = mixc([0.96, 0.845, 0.58], [0.79, 0.55, 0.295], smooth(0.35, 1.05, er));
-    const brothNoise = fbm(x * 14 + 7, y * 14, 3);
-    food = mixc(food, [0.90, 0.68, 0.40], (brothNoise - 0.5) * 0.35);
-    // fatty swirls: paler marbling drifting through the broth
+    let food = mixc([0.955, 0.835, 0.565], [0.775, 0.535, 0.285], smooth(0.3, 1.05, er));
+    const brothNoise = fbm(x * 13 + 7, y * 13, 3);
+    food = mixc(food, [0.885, 0.66, 0.385], (brothNoise - 0.5) * 0.38);
     const swirl = fbm(x * 6 - y * 4, y * 6 + x * 3, 3);
-    food = mixc(food, [0.985, 0.92, 0.72], smooth(0.55, 0.8, swirl) * 0.5);
+    food = mixc(food, [0.985, 0.915, 0.71], smooth(0.55, 0.8, swirl) * 0.5);
+    // broad specular sheen of the key light on the broth, upper left
+    const spec = Math.exp(-(((x - 0.36) ** 2) / 0.028 + ((y - 0.50) ** 2) / 0.010));
+    food = mixc(food, [1.0, 0.96, 0.82], spec * 0.28);
 
-    // noodle mass under the surface: a fine diagonal strand pattern in
-    // pale wheat, kept very low-contrast so it whispers texture under the
-    // hero strands instead of drawing stripes of its own
-    const wave = Math.sin(((x + y * 0.7) * 210 + fbm(x * 9, y * 9, 2) * 30) + Math.sin(y * 130 + x * 40) * 1.1);
-    const mass = smooth(0.05, 0.7, wave * 0.5 + 0.5) * smooth(0.30, 0.60, fbm(x * 5 + 31, y * 5, 2));
-    food = mixc(food, [0.95, 0.815, 0.50], mass * 0.30);
-    food = mixc(food, [0.845, 0.63, 0.315], smooth(0.8, 0.25, wave * 0.5 + 0.5) * mass * 0.14);
+    // dense noodle mass from the grid: thick strands in broth tones, the
+    // submerged ones (low tone) showing through the broth at half strength
+    // so the mass has depth instead of a neon wire pattern
+    const [md, mtone] = massDist(x, y);
+    if (md < 0.005) {
+      const core = clamp01(1 - Math.abs(md + 0.0032) / 0.0090);
+      let nc = mixc([0.825, 0.615, 0.31], [0.955, 0.83, 0.515], core);
+      nc = mixc(nc, [0.875, 0.66, 0.345], (mtone - 0.5) * 0.30);
+      nc = mixc(nc, [1.0, 0.945, 0.72], smooth(0.82, 1, core) * 0.26);
+      const subm = mtone < 0.38 ? 0.5 : 1.0;
+      const edgeFade = smooth(1.0, 0.88, er);
+      food = over(food, nc, cov(md, 0.0016) * subm * (0.35 + 0.65 * edgeFade));
+    }
 
-    // glossy oil droplets
+    // oil + chilli droplets with a specular pip
     for (let i = 0; i < oils.length; i++) {
       const d = sdCircle(x, y, oils[i][0], oils[i][1], oils[i][2]);
       if (d < 0.004) {
-        food = mixc(food, [0.99, 0.90, 0.60], cov(d, 0.0018) * 0.55);
+        food = mixc(food, [0.99, 0.895, 0.585], cov(d, 0.0018) * 0.6);
+        const pip = sdCircle(x, y, oils[i][0] - oils[i][2] * 0.3, oils[i][1] - oils[i][2] * 0.3, oils[i][2] * 0.32);
+        food = mixc(food, [1.0, 0.99, 0.92], cov(pip, 0.001) * 0.7);
       }
     }
+    for (let i = 0; i < chilli.length; i++) {
+      const d = sdCircle(x, y, chilli[i][0], chilli[i][1], chilli[i][2]);
+      if (d < 0.003) food = mixc(food, [0.78, 0.24, 0.05], cov(d, 0.0014) * 0.65);
+    }
 
-    // ---- nori sheets standing at the back of the bowl ----
-    for (const [nx, ny, ang] of [[0.345, 0.375, -0.14], [0.405, 0.362, -0.03]]) {
-      const d = sdBoxRot(x, y, nx, ny, 0.040, 0.062, ang);
+    // ---- nori sheets at the back of the bowl ----
+    for (const [nx, ny, ang] of [[0.295, 0.475, -0.15], [0.355, 0.462, -0.04]]) {
+      const d = sdBoxRot(x, y, nx, ny, 0.038, 0.06, ang);
       if (d < 0.004) {
         const sheen = fbm(x * 40, y * 40, 2);
-        let nori = mixc([0.030, 0.048, 0.034], [0.065, 0.105, 0.065], sheen);
+        let nori = mixc([0.028, 0.045, 0.032], [0.062, 0.10, 0.062], sheen);
         nori = mixc(nori, [0.22, 0.30, 0.20], smooth(0.003, -0.004, d) * 0.22);
         food = over(food, nori, cov(d, 0.0022));
       }
     }
 
-    // ---- hero noodle strands on the surface: soft shadow pass first so
-    // the strands sit IN the broth, then the lit strand itself ----
-    for (let i = 0; i < brothStrands.length; i++) {
-      const s = brothStrands[i];
-      const dSh = strandDist(x, y + 0.005, s.pts) - s.r * 1.15;
-      if (dSh < 0.004) food = mixc(food, [0.62, 0.42, 0.19], cov(dSh, 0.0025) * 0.35);
-    }
-    for (let i = 0; i < brothStrands.length; i++) {
-      const s = brothStrands[i];
-      const d = strandDist(x, y, s.pts) - s.r;
+    // ---- menma: three bamboo shoots standing at the back right ----
+    for (const [mx, my, ang] of [[0.775, 0.52, 0.5], [0.80, 0.545, 0.62], [0.755, 0.555, 0.38]]) {
+      const d = sdBoxRot(x, y, mx, my, 0.011, 0.052, ang);
       if (d < 0.004) {
-        const a = cov(d, 0.0016);
-        // cylindrical shading across the strand using the distance gradient
-        const core = clamp01(1 - Math.abs(d + s.r * 0.4) / (s.r * 1.4));
-        let nc = mixc([0.835, 0.615, 0.30], [0.955, 0.825, 0.51], core);
-        nc = mixc(nc, [1.0, 0.93, 0.70], smooth(0.78, 1, core) * 0.30);
-        food = over(food, nc, a);
+        let mm = mixc([0.76, 0.565, 0.30], [0.85, 0.68, 0.42], fbm(x * 50, y * 20, 2));
+        mm = mixc(mm, [0.45, 0.30, 0.14], smooth(0.0025, -0.003, d) * 0.5);
+        food = over(food, mm, cov(d, 0.0018));
       }
     }
 
-    // ---- chashu slices: seared rolled pork, left of centre. Irregular
-    // outline and fbm marbling instead of perfect rings, so they read as
-    // meat, not donuts ----
-    for (const [hx, hy, hr, rot] of [[0.375, 0.545, 0.082, 0.4], [0.44, 0.605, 0.077, 2.2]]) {
+    // ---- chashu: two big seared slices, front left ----
+    for (const [hx, hy, hr, rot] of [[0.345, 0.665, 0.09, 0.4], [0.42, 0.735, 0.082, 2.2]]) {
       const angC = Math.atan2(y - hy, x - hx);
-      const wob = 1 + (fbm(Math.cos(angC) * 2 + hx * 40, Math.sin(angC) * 2 + rot * 9, 2) - 0.5) * 0.14;
+      const wob = 1 + (fbm(Math.cos(angC) * 2 + hx * 40, Math.sin(angC) * 2 + rot * 9, 2) - 0.5) * 0.13;
       const d = sdEllipse(x, y, hx, hy, hr * wob, hr * 0.86 * wob);
       if (d < 0.006) {
-        // soft shadow where the slice sits in the broth
-        const dSh = sdEllipse(x, y + 0.006, hx, hy, hr * wob, hr * 0.86 * wob);
-        food = mixc(food, [0.60, 0.40, 0.18], cov(dSh, 0.003) * 0.30);
+        const dSh = sdEllipse(x, y + 0.007, hx, hy, hr * wob, hr * 0.86 * wob);
+        food = mixc(food, [0.585, 0.395, 0.175], cov(dSh, 0.0035) * 0.32);
         const dd = Math.sqrt((x - hx) ** 2 + (y - hy) ** 2);
-        const marb = fbm(x * 34 + rot * 20, y * 34, 3);
-        let meat = mixc([0.615, 0.285, 0.175], [0.735, 0.395, 0.245], marb);
-        // pale fat patches where the noise runs high
-        meat = mixc(meat, [0.94, 0.79, 0.615], smooth(0.55, 0.75, marb) * 0.8);
-        // a lean rosier heart
-        meat = mixc(meat, [0.52, 0.225, 0.145], smooth(hr * 0.55, hr * 0.15, dd) * 0.30);
-        // seared dark rim: driven by radial distance so only the outer
-        // ring chars, never the middle of the slice
-        meat = mixc(meat, [0.30, 0.13, 0.065], smooth(0.80, 0.99, dd / (hr * wob)) * 0.75);
-        // juicy gloss
-        const gl = Math.exp(-(((x - hx + hr * 0.3) ** 2) / 0.0012 + ((y - hy + hr * 0.35) ** 2) / 0.0006));
-        meat = mixc(meat, [1.0, 0.85, 0.65], gl * 0.32);
+        const marb = fbm(x * 30 + rot * 20, y * 30, 3);
+        const marb2 = fbm(x * 65 + rot * 7, y * 65, 2);
+        let meat = mixc([0.60, 0.275, 0.165], [0.725, 0.385, 0.235], marb * 0.75 + marb2 * 0.25);
+        meat = mixc(meat, [0.94, 0.79, 0.615], smooth(0.58, 0.78, marb * 0.55 + marb2 * 0.45) * 0.8);
+        meat = mixc(meat, [0.51, 0.215, 0.14], smooth(hr * 0.55, hr * 0.15, dd) * 0.30);
+        // charred flecks near the rim
+        const char = smooth(0.72, 0.9, fbm(x * 90 + rot * 31, y * 90, 2)) * smooth(0.72, 0.97, dd / (hr * wob));
+        meat = mixc(meat, [0.16, 0.07, 0.04], char * 0.8);
+        meat = mixc(meat, [0.30, 0.13, 0.065], smooth(0.82, 0.995, dd / (hr * wob)) * 0.7);
+        const gl = Math.exp(-(((x - hx + hr * 0.3) ** 2) / 0.0013 + ((y - hy + hr * 0.35) ** 2) / 0.00065));
+        meat = mixc(meat, [1.0, 0.86, 0.66], gl * 0.34);
         food = over(food, meat, cov(d, 0.0022));
       }
     }
 
-    // ---- ajitama egg halves: glossy jammy yolks, right of centre ----
-    for (const [ex, ey, er, rot] of [[0.615, 0.575, 0.062, 0.5], [0.665, 0.50, 0.055, 2.4]]) {
+    // ---- ajitama halves, right side ----
+    for (const [ex, ey, er, rot] of [[0.665, 0.695, 0.066, 0.5], [0.72, 0.605, 0.058, 2.4]]) {
       const d = sdEllipse(x, y, ex, ey, er, er * 0.88);
       if (d < 0.006) {
-        // shadow so the white lifts off the pale broth
-        const dSh = sdEllipse(x, y + 0.005, ex, ey, er, er * 0.88);
-        food = mixc(food, [0.62, 0.44, 0.20], cov(dSh, 0.003) * 0.32);
+        const dSh = sdEllipse(x, y + 0.006, ex, ey, er, er * 0.88);
+        food = mixc(food, [0.60, 0.425, 0.19], cov(dSh, 0.003) * 0.32);
         let egg = [0.985, 0.965, 0.915];
-        const marinade = smooth(0.002, -0.016, d);
-        egg = mixc(egg, [0.855, 0.635, 0.40], marinade * 0.55);
+        egg = mixc(egg, [0.85, 0.625, 0.395], smooth(0.002, -0.016, d) * 0.55);
         food = over(food, egg, cov(d, 0.002));
-        // yolk: molten golden centre, deep orange rim, shaded lower crescent
         const yd = sdEllipse(x, y, ex, ey, er * 0.63, er * 0.56);
         if (yd < 0.004) {
           const yr = clamp01(Math.sqrt(((x - ex) / (er * 0.63)) ** 2 + ((y - ey) / (er * 0.56)) ** 2));
-          let yolk = mixc([1.0, 0.735, 0.175], [0.925, 0.455, 0.055], smooth(0.30, 1.0, yr));
-          yolk = mixc(yolk, [0.85, 0.36, 0.04], smooth(0.02, 0.20, y - ey) * 0.30);
-          const gl = Math.exp(-(((x - ex + er * 0.16) ** 2) / 0.00035 + ((y - ey + er * 0.18) ** 2) / 0.0002));
-          yolk = mixc(yolk, [1.0, 0.93, 0.65], gl * 0.6);
+          let yolk = mixc([1.0, 0.735, 0.175], [0.92, 0.45, 0.05], smooth(0.28, 1.0, yr));
+          yolk = mixc(yolk, [0.845, 0.355, 0.035], smooth(0.02, 0.20, y - ey) * 0.30);
+          const gl = Math.exp(-(((x - ex + er * 0.16) ** 2) / 0.0004 + ((y - ey + er * 0.18) ** 2) / 0.00022));
+          yolk = mixc(yolk, [1.0, 0.93, 0.65], gl * 0.62);
           food = over(food, yolk, cov(yd, 0.0018));
         }
       }
     }
 
-    // ---- spring-onion rings over everything: deeper greens, soft light ----
+    // ---- spring-onion rings ----
     for (let i = 0; i < onions.length; i++) {
       const [ox, oy, orr] = onions[i];
       const d = sdCircle(x, y, ox, oy, orr);
@@ -395,56 +411,83 @@ function shade(x, y) {
         food = over(food, oc, cov(d, 0.0011));
       }
     }
+    // ---- sesame seeds ----
+    for (let i = 0; i < sesame.length; i++) {
+      const [sx, sy, sa] = sesame[i];
+      const d = sdEllipse(x, y, sx, sy, 0.0028, 0.0017);
+      if (d < 0.002) food = over(food, [0.96, 0.90, 0.76], cov(d, 0.0009) * 0.75);
+    }
 
     col = over(col, food, cov(innerD, 0.003));
   }
 
-  // ---- steam: soft wisps curling up from the broth ----
+  // ---- shadow the lifted bundle casts on the bowl ----
+  if (x > 0.44 && x < 0.72 && y > 0.30 && y < 0.72) {
+    for (let i = 0; i < liftStrands.length; i++) {
+      const s = liftStrands[i];
+      const d = strandDist(x - 0.014, y - 0.022, s.pts) - s.r * 1.3;
+      if (d < 0.006) col = mixc(col, [0.30, 0.19, 0.08], cov(d, 0.004) * 0.20);
+    }
+  }
+
+  // ---- steam: layered volumetric wisps, lit from the left ----
   {
-    const rise = smooth(0.52, 0.30, y) * smooth(0.06, 0.30, y);
+    const rise = smooth(0.55, 0.32, y) * smooth(0.02, 0.26, y);
     if (rise > 0.001) {
-      const curl = fbm(x * 7 + y * 3.5, y * 5 - 1.5, 3);
-      const wisp = Math.exp(-(((x - 0.46 - (0.5 - y) * 0.06) ** 2) / 0.006)) * 0.7
-        + Math.exp(-(((x - 0.58 - (0.5 - y) * 0.04) ** 2) / 0.004)) * 0.55
-        + Math.exp(-(((x - 0.38 - (0.5 - y) * 0.08) ** 2) / 0.003)) * 0.4;
-      const a = clamp01(wisp * rise * (0.35 + curl * 0.75)) * 0.30;
-      col = over(col, [0.98, 0.97, 0.95], a);
+      const curl = fbm(x * 6 + y * 3.2, y * 4.6 - 1.5, 3);
+      const curl2 = fbm(x * 13 - y * 2, y * 9 + 4, 2);
+      let wisp = Math.exp(-(((x - 0.44 - (0.5 - y) * 0.07) ** 2) / 0.007)) * 0.75
+        + Math.exp(-(((x - 0.60 - (0.5 - y) * 0.05) ** 2) / 0.005)) * 0.6
+        + Math.exp(-(((x - 0.33 - (0.5 - y) * 0.09) ** 2) / 0.0035)) * 0.45
+        + Math.exp(-(((x - 0.52 - (0.5 - y) * 0.03) ** 2) / 0.0028)) * 0.5;
+      wisp *= 0.55 + curl * 0.65 + (curl2 - 0.5) * 0.3;
+      const a = clamp01(wisp * rise) * 0.30;
+      col = over(col, [0.985, 0.975, 0.955], a);
     }
   }
 
-  // ---- lifted noodle bundle (only near the chopstick grip) ----
-  if (x > 0.52 && x < 0.72 && y > 0.22 && y < 0.60) for (let i = 0; i < liftStrands.length; i++) {
-    const s = liftStrands[i];
-    const d = strandDist(x, y, s.pts) - s.r;
-    if (d < 0.004) {
-      const core = clamp01(1 - Math.abs(d + s.r * 0.4) / (s.r * 1.4));
-      let nc = mixc([0.80, 0.60, 0.29], [0.965, 0.85, 0.53], core);
-      nc = mixc(nc, [1.0, 0.94, 0.72], smooth(0.75, 1, core) * 0.38);
-      // broth droplets clinging to the strands glisten
-      col = over(col, nc, cov(d, 0.0016));
+  // ---- the noodle pull itself: a soft dark-gold core behind the strands
+  // so the bundle reads as separate noodles over shadow, not a solid slab --
+  if (x > 0.44 && x < 0.70 && y > 0.15 && y < 0.66) {
+    const dCore = sdSegment(x, y, GRIP[0], GRIP[1], GRIP[0] + 0.008, GRIP[1] + 0.37);
+    col = mixc(col, [0.48, 0.325, 0.145], cov(dCore - 0.030, 0.020) * 0.42);
+  }
+  // ---- glossy broth-coated strands ----
+  if (x > 0.42 && x < 0.72 && y > 0.14 && y < 0.68) {
+    for (let i = 0; i < liftStrands.length; i++) {
+      const s = liftStrands[i];
+      const d = strandDist(x, y, s.pts) - s.r;
+      if (d < 0.004) {
+        const core = clamp01(1 - Math.abs(d + s.r * 0.35) / (s.r * 1.35));
+        let nc = mixc([0.79, 0.575, 0.27], [0.97, 0.855, 0.535], core);
+        nc = mixc(nc, [0.90, 0.685, 0.37], (s.tone - 0.5) * 0.3);
+        // wet sheen: a bright thread down the lit side of each strand
+        nc = mixc(nc, [1.0, 0.96, 0.78], smooth(0.72, 1, core) * 0.5);
+        col = over(col, nc, cov(d, 0.0016));
+      }
     }
   }
 
-  // ---- chopsticks: warm wood, entering from the top right ----
-  for (const off of [0, 0.021]) {
-    const ax = 0.985, ay = 0.015 + off * 0.4;
+  // ---- chopsticks: warm wood from the top right, thicker at this range --
+  for (const off of [0, 0.023]) {
+    const ax = 0.995, ay = 0.008 + off * 0.4;
     const bx = GRIP[0] + off * 0.55, by = GRIP[1] + off;
     const d = sdSegment(x, y, ax, ay, bx, by);
-    // taper: thinner near the tip
     const along = clamp01(((x - bx) * (ax - bx) + (y - by) * (ay - by)) / ((ax - bx) ** 2 + (ay - by) ** 2));
-    const r = lerp(0.0032, 0.0075, along);
+    const r = lerp(0.0034, 0.0085, along);
     const dd = d - r;
     if (dd < 0.004) {
-      let wood = mixc([0.42, 0.235, 0.10], [0.62, 0.39, 0.19], fbm(x * 60, y * 8, 2));
-      wood = mixc(wood, [0.85, 0.62, 0.36], smooth(0.002, -0.003, dd) * 0.35);
+      let wood = mixc([0.40, 0.22, 0.095], [0.60, 0.375, 0.18], fbm(x * 55, y * 8, 2));
+      wood = mixc(wood, [0.84, 0.61, 0.35], smooth(0.002, -0.003, dd) * 0.35);
+      wood = mixc(wood, [0.18, 0.09, 0.04], smooth(0.75, 1.0, along) * 0.25);
       col = over(col, wood, cov(dd, 0.0016));
     }
   }
 
-  // ---- final grade: warm light, gentle vignette ----
-  const vig = 1 - 0.38 * smooth(0.45, 1.05, Math.sqrt((x - 0.5) ** 2 + (y - 0.48) ** 2));
-  const key = 1 + 0.10 * Math.exp(-(((x - 0.34) ** 2) / 0.2 + ((y - 0.30) ** 2) / 0.16));
-  return [col[0] * vig * key * 1.04, col[1] * vig * key, col[2] * vig * key * 0.94];
+  // ---- final grade inside the pixel shader (vignette + warm key) ----
+  const vig = 1 - 0.40 * smooth(0.42, 1.05, Math.sqrt((x - 0.5) ** 2 + (y - 0.46) ** 2));
+  const key = 1 + 0.11 * Math.exp(-(((x - 0.33) ** 2) / 0.2 + ((y - 0.28) ** 2) / 0.16));
+  return [col[0] * vig * key * 1.05, col[1] * vig * key, col[2] * vig * key * 0.93];
 }
 
 // ------------------------------------------------------------------- PNG --
@@ -476,11 +519,9 @@ function encodePNG(w, h, rgba) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // colour type RGBA
-  // Per-row adaptive filtering: try None/Sub/Up/Average/Paeth and keep the
-  // row whose filtered bytes have the smallest signed-byte energy. Smooth
-  // gradients compress far better this way, keeping the file under 1 MiB.
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  // Per-row adaptive filtering keeps the smooth gradients small.
   const stride = w * 4;
   const raw = Buffer.alloc((stride + 1) * h);
   const cand = Buffer.alloc(stride);
@@ -509,10 +550,7 @@ function encodePNG(w, h, rgba) {
         cand[i] = v;
         score += v < 128 ? v : 256 - v;
       }
-      if (score < bestScore) {
-        bestScore = score; bestType = ft;
-        cand.copy(best, 0, 0, stride);
-      }
+      if (score < bestScore) { bestScore = score; bestType = ft; cand.copy(best, 0, 0, stride); }
     }
     raw[yy * (stride + 1)] = bestType;
     best.copy(raw, yy * (stride + 1) + 1, 0, stride);
@@ -528,7 +566,8 @@ function encodePNG(w, h, rgba) {
 // ------------------------------------------------------------------ main --
 
 function render() {
-  const rgba = Buffer.alloc(W * H * 4);
+  // Pass 1: shade every pixel into a float buffer.
+  const img = new Float32Array(W * H * 3);
   for (let py = 0; py < H; py++) {
     for (let px = 0; px < W; px++) {
       let r = 0, g = 0, b = 0;
@@ -540,13 +579,52 @@ function render() {
           r += c[0]; g += c[1]; b += c[2];
         }
       }
-      const n = SS * SS;
-      const dith = dither(px, py) * 0.006;
-      const i = (py * W + px) * 4;
-      rgba[i] = Math.round(clamp01(r / n + dith) * 255);
-      rgba[i + 1] = Math.round(clamp01(g / n + dith) * 255);
-      rgba[i + 2] = Math.round(clamp01(b / n + dith) * 255);
-      rgba[i + 3] = 255;
+      const n = SS * SS, i = (py * W + px) * 3;
+      img[i] = r / n; img[i + 1] = g / n; img[i + 2] = b / n;
+    }
+  }
+  // Pass 2: shallow depth of field — a separable box blur of the whole
+  // frame, mixed in only where the pixel sits outside the bowl's focus
+  // zone, so the table and the far corners melt while the food stays crisp.
+  const tmp = new Float32Array(W * H * 3);
+  const blur = new Float32Array(W * H * 3);
+  const R = 5;
+  for (let yy = 0; yy < H; yy++) {
+    for (let xx = 0; xx < W; xx++) {
+      let r = 0, g = 0, b = 0, cnt = 0;
+      for (let k = -R; k <= R; k++) {
+        const sx = Math.min(W - 1, Math.max(0, xx + k));
+        const i = (yy * W + sx) * 3;
+        r += img[i]; g += img[i + 1]; b += img[i + 2]; cnt++;
+      }
+      const o = (yy * W + xx) * 3;
+      tmp[o] = r / cnt; tmp[o + 1] = g / cnt; tmp[o + 2] = b / cnt;
+    }
+  }
+  for (let yy = 0; yy < H; yy++) {
+    for (let xx = 0; xx < W; xx++) {
+      let r = 0, g = 0, b = 0, cnt = 0;
+      for (let k = -R; k <= R; k++) {
+        const sy = Math.min(H - 1, Math.max(0, yy + k));
+        const i = (sy * W + xx) * 3;
+        r += tmp[i]; g += tmp[i + 1]; b += tmp[i + 2]; cnt++;
+      }
+      const o = (yy * W + xx) * 3;
+      blur[o] = r / cnt; blur[o + 1] = g / cnt; blur[o + 2] = b / cnt;
+    }
+  }
+  const rgba = Buffer.alloc(W * H * 4);
+  for (let py = 0; py < H; py++) {
+    for (let px = 0; px < W; px++) {
+      const x = (px + 0.5) / W, y = (py + 0.5) / H;
+      const od = sdEllipse(x, y, BCX, BCY, BRX, BRY);
+      const f = smooth(0.015, 0.11, od) * 0.7;
+      const i3 = (py * W + px) * 3, i4 = (py * W + px) * 4;
+      const dith = dither(px, py) * 0.005;
+      rgba[i4] = Math.round(clamp01(lerp(img[i3], blur[i3], f) + dith) * 255);
+      rgba[i4 + 1] = Math.round(clamp01(lerp(img[i3 + 1], blur[i3 + 1], f) + dith) * 255);
+      rgba[i4 + 2] = Math.round(clamp01(lerp(img[i3 + 2], blur[i3 + 2], f) + dith) * 255);
+      rgba[i4 + 3] = 255;
     }
   }
   return encodePNG(W, H, rgba);
