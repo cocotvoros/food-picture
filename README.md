@@ -13,7 +13,7 @@ jammy deep-orange yolks, dark nori sheets, chopped spring onions,
 chilli-oil droplets glistening on the broth, and delicate steam
 curling through warm, dramatic light over a dark wooden table.
 
-The photograph is `photo.jpg` (1024×1024, 209,190 bytes). This
+The photograph is `photo.jpg` (1024×1024, 196,689 bytes). This
 repository began as a fully procedural pixel renderer of the same bowl
 (see the git history); the photograph is the stronger plate, so it is
 the one served.
